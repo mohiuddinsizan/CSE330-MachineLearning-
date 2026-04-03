@@ -47,7 +47,6 @@ st.set_page_config(
 )
 
 st.title("🩺 COVID-19 Clinical Decision Support System")
-st.caption("Notebook-aligned Streamlit frontend for presentation.")
 
 DEFAULT_DATA_PATH = "COVID-19_RECOVERY_DATASET.csv"
 
@@ -66,6 +65,7 @@ IRRELEVANT_COLS = [
 SEV_ORDER = {"Mild": 0, "Moderate": 1, "Severe": 2, "Critical": 3}
 TASK_ORDER = ["ICU Escalation", "Severity", "Severity Progression", "Mortality"]
 MODEL_ORDER = ["Logistic Regression", "Random Forest", "XGBoost", "Neural Network"]
+SEV_CLASSES = ["Mild", "Moderate", "Severe", "Critical"]
 
 TASK_META = {
     "ICU Escalation": {
@@ -88,14 +88,6 @@ TASK_META = {
         "binary": True,
         "display_classes": ["Survived", "Died"],
     },
-}
-
-# Fixed notebook-style prediction defaults for presentation
-PREDICTION_MODEL_DEFAULTS = {
-    "ICU Escalation": "Random Forest",
-    "Severity": "Random Forest",
-    "Severity Progression": "Random Forest",
-    "Mortality": "Random Forest",
 }
 
 
@@ -136,11 +128,7 @@ def safe_ohe() -> OneHotEncoder:
 def build_xgb_classifier(**kwargs):
     if not HAS_XGBOOST:
         raise RuntimeError("xgboost is not installed.")
-    try:
-        return XGBClassifier(**kwargs)
-    except TypeError:
-        kwargs.pop("use_label_encoder", None)
-        return XGBClassifier(**kwargs)
+    return XGBClassifier(**kwargs)
 
 
 def load_data(path: str, uploaded_file=None) -> pd.DataFrame:
@@ -306,6 +294,8 @@ def add_post_admission_features(df: pd.DataFrame) -> pd.DataFrame:
 
     if "severity" in df.columns:
         df["severity_progressed"] = df["severity"].isin(["Severe", "Critical"]).astype(int)
+    else:
+        df["severity_progressed"] = 0
 
     return df
 
@@ -340,10 +330,26 @@ def get_feature_cols(df_data: pd.DataFrame, target_col: str) -> List[str]:
             ]
         )
     elif target_col == "death":
-        exclude.update(["mortality", "severity_progressed"])
+        exclude.update(
+            [
+                "mortality",
+                "severity",
+                "severity_score",
+                "severity_progressed",
+                "sev_x_icu",
+                "sev_x_vent",
+            ]
+        )
     elif target_col == "severity":
-        # IMPORTANT: notebook-style generic severity flow
-        exclude.update(["severity_progressed", "severity_score"])
+        exclude.update(
+            [
+                "severity_progressed",
+                "severity_score",
+                "sev_x_icu",
+                "sev_x_vent",
+                "icu_admission",
+            ]
+        )
 
     return [c for c in df_data.columns if c not in exclude]
 
@@ -387,10 +393,10 @@ def get_model_factories(task_name: str) -> Dict[str, object]:
                 solver="lbfgs",
             ),
             "Random Forest": RandomForestClassifier(
-                n_estimators=200,
-                max_depth=15,
-                min_samples_split=10,
-                min_samples_leaf=4,
+                n_estimators=220,
+                max_depth=14,
+                min_samples_split=8,
+                min_samples_leaf=3,
                 random_state=42,
                 n_jobs=-1,
             ),
@@ -418,7 +424,6 @@ def get_model_factories(task_name: str) -> Dict[str, object]:
                 colsample_bytree=0.8,
                 random_state=42,
                 eval_metric="mlogloss",
-                use_label_encoder=False,
                 n_jobs=-1,
             )
     else:
@@ -544,7 +549,6 @@ def build_task_base(df_task: pd.DataFrame, task_name: str) -> TaskArtifacts:
         label_encoder = LabelEncoder()
         y = label_encoder.fit_transform(data[target_col].astype(str))
 
-    # CRITICAL FIX: use generic notebook-style feature selector for Severity too
     feature_cols_raw = get_feature_cols(data, target_col)
     X_raw = data[feature_cols_raw].copy()
 
@@ -678,94 +682,6 @@ def best_model_name(task_art: TaskArtifacts) -> Optional[str]:
     return str(task_art.model_results.iloc[0]["Model"])
 
 
-def notebook_default_model_name(task_art: TaskArtifacts) -> Optional[str]:
-    preferred = PREDICTION_MODEL_DEFAULTS.get(task_art.task_name, "Random Forest")
-    if preferred in task_art.models:
-        return preferred
-    if task_art.model_results.empty:
-        return None
-    return str(task_art.model_results.iloc[0]["Model"])
-
-
-def create_patient_input(df: pd.DataFrame) -> pd.DataFrame:
-    def safe_choices(col: str, fallback: List[str]) -> List[str]:
-        if col in df.columns:
-            vals = [str(v) for v in df[col].dropna().unique() if str(v) not in ("nan", "None", "")]
-            vals = sorted(vals)
-            return vals if vals else fallback
-        return fallback
-
-    gender_opts = safe_choices("gender", ["Male", "Female", "Other"])
-    vacc_opts = safe_choices("vaccination_status", ["Booster", "Full", "Partial"])
-    variant_opts = safe_choices("variant", ["Alpha", "Delta", "Omicron"])
-    country_opts = safe_choices("country", ["Bangladesh", "India", "Pakistan", "USA"])[:25]
-    region_opts = safe_choices("region/state", ["Dhaka", "Sindh", "Chattogram"])[:25]
-    comor_opts = safe_choices("comorbidities", ["None", "Diabetes", "Hypertension", "Asthma", "Heart Disease"])
-    sym1_opts = safe_choices("symptoms_1", ["Fever", "Cough", "Shortness of Breath", "Fatigue"])
-    sym2_opts = safe_choices("symptoms_2", ["None", "Headache", "Loss of Smell", "Chest Pain"])
-    sym3_opts = safe_choices("symptoms_3", ["None", "Myalgia", "Nausea", "Diarrhoea"])
-    trt1_opts = safe_choices("treatment_given_1", ["Oxygen", "Remdesivir", "Steroids", "Paracetamol"])
-    trt2_opts = safe_choices("treatment_given_2", ["None", "Antibiotics", "Steroids"])
-    test_opts = safe_choices("test_type", ["PCR", "Antigen"])
-    severity_opts = ["Mild", "Moderate", "Severe", "Critical"]
-
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        age = st.slider("Age", 1, 100, 21)
-        gender = st.selectbox("Gender", gender_opts)
-        vaccination_status = st.selectbox("Vaccination Status", vacc_opts)
-        variant = st.selectbox("Variant", variant_opts)
-        country = st.selectbox("Country", country_opts)
-        region_state = st.selectbox("Region / State", region_opts)
-
-    with c2:
-        comorbidities = st.selectbox("Comorbidity", comor_opts)
-        symptoms_1 = st.selectbox("Symptom 1", sym1_opts)
-        symptoms_2 = st.selectbox("Symptom 2", sym2_opts)
-        symptoms_3 = st.selectbox("Symptom 3", sym3_opts)
-        severity = st.selectbox("Current Severity", severity_opts, index=2)
-        tests_conducted = st.slider("Tests Conducted", 1, 15, 4)
-
-    with c3:
-        test_type = st.selectbox("Test Type", test_opts)
-        treatment_given_1 = st.selectbox("Treatment 1", trt1_opts)
-        treatment_given_2 = st.selectbox("Treatment 2", trt2_opts)
-        hospitalized = st.checkbox("Hospitalized", value=True)
-        ventilator_support = st.checkbox("Ventilator Support", value=True)
-        icu_admission = st.checkbox("Already in ICU", value=False)
-
-    patient = pd.DataFrame(
-        [
-            {
-                "age": age,
-                "gender": gender,
-                "vaccination_status": vaccination_status,
-                "variant": variant,
-                "country": country,
-                "region/state": region_state,
-                "comorbidities": comorbidities,
-                "symptoms_1": symptoms_1,
-                "symptoms_2": symptoms_2,
-                "symptoms_3": symptoms_3,
-                "severity": severity,
-                "tests_conducted": tests_conducted,
-                "test_type": test_type,
-                "treatment_given_1": treatment_given_1,
-                "treatment_given_2": treatment_given_2,
-                "hospitalized": int(hospitalized),
-                "ventilator_support": int(ventilator_support),
-                "icu_admission": int(icu_admission),
-                "death": 0,
-            }
-        ]
-    )
-
-    patient = add_post_admission_features(patient)
-    patient["severity_progressed"] = patient["severity"].isin(["Severe", "Critical"]).astype(int)
-    return patient
-
-
 def align_patient_to_task(patient_df: pd.DataFrame, task_art: TaskArtifacts) -> pd.DataFrame:
     temp = patient_df.copy()
     for col in task_art.feature_columns_raw:
@@ -795,7 +711,40 @@ def predict_for_task(task_art: TaskArtifacts, patient_df: pd.DataFrame, model_na
         "label": label,
         "probability": prob,
         "all_probabilities": probs[0],
+        "pred_idx": pred_idx,
+        "patient_proc": patient_proc,
     }
+
+
+def apply_consistency_rules(
+    severity_label: str,
+    icu_prob: float,
+    mort_prob: float,
+    hospitalized: int,
+    ventilator_support: int,
+) -> Tuple[str, str]:
+    severity_idx = {c: i for i, c in enumerate(SEV_CLASSES)}
+    current_idx = severity_idx.get(severity_label, 0)
+
+    upgraded_idx = current_idx
+
+    if ventilator_support == 1 and upgraded_idx < 2:
+        upgraded_idx = 2
+
+    if icu_prob >= 0.60 and upgraded_idx < 2:
+        upgraded_idx = 2
+
+    if mort_prob >= 0.70 and upgraded_idx < 3:
+        upgraded_idx = 3
+
+    if hospitalized == 1 and mort_prob >= 0.50 and upgraded_idx < 2:
+        upgraded_idx = 2
+
+    final_label = SEV_CLASSES[upgraded_idx]
+    note = ""
+    if final_label != severity_label:
+        note = f"Severity adjusted from {severity_label} to {final_label} for consistency."
+    return final_label, note
 
 
 def triage_text(icu_prob: float, mort_prob: float, severity_label: str) -> str:
@@ -807,156 +756,225 @@ def triage_text(icu_prob: float, mort_prob: float, severity_label: str) -> str:
     return "🟢 LOWER RISK — Standard care with routine reassessment"
 
 
-def plot_model_comparison(task_art: TaskArtifacts):
-    if task_art.model_results.empty:
-        st.info("No model trained yet for this task.")
-        return
-
-    df = task_art.model_results.copy()
-    fig, ax = plt.subplots(figsize=(10, 4.5))
-    x = np.arange(len(df))
-    w = 0.35
-    ax.bar(x - w / 2, df["Accuracy"], w, label="Accuracy")
-    ax.bar(x + w / 2, df["ROC-AUC"], w, label="ROC-AUC")
-    ax.set_xticks(x)
-    ax.set_xticklabels(df["Model"], rotation=15, ha="right")
-    ax.set_ylim(0, 1)
-    ax.set_title(f"{task_art.task_name} — Model Comparison")
-    ax.grid(True, alpha=0.25, axis="y")
-    ax.legend()
-    st.pyplot(fig)
+def _clamp_index(idx: int, size: int) -> int:
+    if size <= 0:
+        return 0
+    return max(0, min(int(idx), size - 1))
 
 
-def plot_roc_for_task(task_art: TaskArtifacts):
-    if task_art.model_results.empty:
-        st.info("No model trained yet for this task.")
-        return
+def select_shap_vector(shap_output, pred_idx: int) -> np.ndarray:
+    if hasattr(shap_output, "values"):
+        arr = np.asarray(shap_output.values)
+    elif isinstance(shap_output, list):
+        if len(shap_output) == 0:
+            raise ValueError("Empty SHAP output list.")
+        idx = _clamp_index(pred_idx, len(shap_output))
+        arr = np.asarray(shap_output[idx])
+    else:
+        arr = np.asarray(shap_output)
 
-    if not task_art.is_binary:
-        st.info("ROC curves are shown only for binary tasks. Severity uses weighted multiclass ROC-AUC in the table.")
-        return
+    if arr.ndim == 1:
+        return arr
 
-    fig, ax = plt.subplots(figsize=(7, 5))
-    for _, row in task_art.model_results.iterrows():
-        probs = row["Probabilities"][:, 1]
-        fpr, tpr, _ = roc_curve(task_art.y_test, probs)
-        ax.plot(fpr, tpr, label=f"{row['Model']} (AUC={row['ROC-AUC']:.4f})")
-    ax.plot([0, 1], [0, 1], linestyle="--")
-    ax.set_title(f"{task_art.task_name} — ROC Curves")
-    ax.set_xlabel("False Positive Rate")
-    ax.set_ylabel("True Positive Rate")
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.25)
-    st.pyplot(fig)
+    if arr.ndim == 2:
+        # (n_samples, n_features)
+        return arr[0]
+
+    if arr.ndim == 3:
+        s0, s1, s2 = arr.shape
+
+        # (1, n_features, n_classes)
+        if s0 == 1 and s2 <= 20:
+            idx = _clamp_index(pred_idx, s2)
+            return arr[0, :, idx]
+
+        # (n_samples, n_features, n_classes)
+        if s2 <= 20 and s0 >= 1:
+            idx = _clamp_index(pred_idx, s2)
+            return arr[0, :, idx]
+
+        # (n_classes, n_samples, n_features)
+        if s0 <= 20 and s1 >= 1:
+            idx = _clamp_index(pred_idx, s0)
+            return arr[idx, 0, :]
+
+        # (n_samples, n_classes, n_features)
+        if s1 <= 20 and s0 >= 1:
+            idx = _clamp_index(pred_idx, s1)
+            return arr[0, idx, :]
+
+    raise ValueError(f"Unsupported SHAP output shape: {arr.shape}")
 
 
-def plot_confusion_for_model(task_art: TaskArtifacts, model_name: str):
+def generate_prediction_shap(task_art: TaskArtifacts, model_name: str, patient_df: pd.DataFrame, pred_idx: int):
+    if not HAS_SHAP:
+        return None, "Install shap to see explanation."
+
     if model_name not in task_art.models:
-        st.info("Train this model first.")
-        return
+        return None, "Model is not trained."
 
-    row = task_art.model_results.loc[task_art.model_results["Model"] == model_name].iloc[0]
-    preds = row["Predictions"]
-    cm = confusion_matrix(task_art.y_test, preds)
+    model = task_art.models[model_name]
+    patient_task = align_patient_to_task(patient_df, task_art)
+    patient_proc = task_art.preprocessor.transform(patient_task)
+    patient_proc_df = pd.DataFrame(patient_proc, columns=task_art.feature_names)
 
-    labels = (
-        TASK_META[task_art.task_name]["display_classes"]
-        if task_art.is_binary
-        else list(task_art.label_encoder.classes_)
-    )
+    try:
+        if hasattr(model, "feature_importances_"):
+            explainer = shap.TreeExplainer(model)
+            shap_output = explainer.shap_values(patient_proc_df)
+        elif hasattr(model, "coef_"):
+            background = task_art.X_train_df.sample(min(80, len(task_art.X_train_df)), random_state=42)
+            try:
+                explainer = shap.LinearExplainer(model, background)
+                shap_output = explainer.shap_values(patient_proc_df)
+            except Exception:
+                explainer = shap.Explainer(model, background)
+                shap_output = explainer(patient_proc_df)
+        else:
+            background = task_art.X_train_df.sample(min(25, len(task_art.X_train_df)), random_state=42)
+            explainer = shap.KernelExplainer(model.predict_proba, background)
+            shap_output = explainer.shap_values(patient_proc_df, nsamples=100)
 
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(cm)
-    ax.set_xticks(range(len(labels)))
-    ax.set_yticks(range(len(labels)))
-    ax.set_xticklabels(labels, rotation=25, ha="right")
-    ax.set_yticklabels(labels)
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("Actual")
-    ax.set_title(f"Confusion Matrix — {model_name}")
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, str(cm[i, j]), ha="center", va="center")
-    fig.colorbar(im, ax=ax)
-    st.pyplot(fig)
+        vec = select_shap_vector(shap_output, pred_idx)
 
+        explain_df = pd.DataFrame(
+            {
+                "feature": task_art.feature_names,
+                "shap_value": vec,
+            }
+        )
+        explain_df["abs_shap"] = explain_df["shap_value"].abs()
+        explain_df = explain_df.sort_values("abs_shap", ascending=False).reset_index(drop=True)
+        return explain_df, None
 
-def plot_feature_importance(task_art: TaskArtifacts, model_name: str, top_n: int = 15):
-    if task_art.feature_importance_df.empty:
-        st.info("No feature importance available yet.")
-        return
-
-    fi = (
-        task_art.feature_importance_df[task_art.feature_importance_df["Model"] == model_name]
-        .copy()
-        .sort_values("importance", ascending=False)
-        .head(top_n)
-    )
-    if fi.empty or float(fi["importance"].sum()) == 0:
-        st.info(f"{model_name} does not expose straightforward feature importances for display here.")
-        return
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.barh(fi["feature"][::-1], fi["importance"][::-1])
-    ax.set_title(f"Top {top_n} Features — {model_name}")
-    ax.set_xlabel("Importance")
-    st.pyplot(fig)
+    except Exception as exc:
+        return None, f"SHAP could not be rendered here: {exc}"
 
 
-def plot_overall_comparison(summary_df: pd.DataFrame):
-    if summary_df.empty:
-        st.info("No trained models yet.")
-        return
+def render_prediction_shap(task_name: str, task_art: TaskArtifacts, model_name: str, patient_df: pd.DataFrame, pred_idx: int):
+    with st.expander(f"Why this {task_name} output came"):
+        explain_df, err = generate_prediction_shap(task_art, model_name, patient_df, pred_idx)
+        if err:
+            st.warning(err)
+            return
 
-    tasks = [t for t in TASK_ORDER if t in summary_df["Task"].unique()]
-    models = [m for m in MODEL_ORDER if m in summary_df["Model"].unique()]
-    x = np.arange(len(tasks))
-    width = 0.18 if len(models) >= 4 else 0.22
+        top_df = explain_df.head(12).copy()
 
-    fig, ax = plt.subplots(figsize=(13, 5))
-    for i, model_name in enumerate(models):
-        aucs = []
-        for task in tasks:
-            row = summary_df[(summary_df["Task"] == task) & (summary_df["Model"] == model_name)]
-            aucs.append(float(row["ROC-AUC"].iloc[0]) if not row.empty else 0.0)
-        ax.bar(x + i * width - (len(models) - 1) * width / 2, aucs, width, label=model_name)
+        fig, ax = plt.subplots(figsize=(8.5, 4.8))
+        ax.barh(top_df["feature"][::-1], top_df["shap_value"][::-1])
+        ax.set_title(f"{task_name} — top feature contributions")
+        ax.set_xlabel("SHAP value")
+        ax.grid(True, alpha=0.25, axis="x")
+        st.pyplot(fig)
 
-    ax.set_title("Overall ROC-AUC Comparison Across Tasks")
-    ax.set_ylabel("ROC-AUC")
-    ax.set_xticks(x)
-    ax.set_xticklabels(tasks, rotation=10)
-    ax.set_ylim(0, 1.02)
-    ax.grid(True, alpha=0.25, axis="y")
-    ax.legend(fontsize=9)
-    st.pyplot(fig)
+        st.dataframe(top_df[["feature", "shap_value", "abs_shap"]].round(4), width="stretch")
 
 
 def optional_shap_section(task_art: TaskArtifacts, selected_model_name: str):
-    if selected_model_name != "XGBoost":
-        st.info("SHAP section is enabled only for XGBoost.")
-        return
-    if not HAS_XGBOOST or not HAS_SHAP:
-        st.warning("Install both `xgboost` and `shap` to show SHAP explainability.")
+    if not HAS_SHAP:
+        st.warning("Install `shap` to show explainability.")
         return
 
-    with st.expander("Show SHAP explainability for this task"):
+    if selected_model_name not in task_art.models:
+        st.info("Train this model first.")
+        return
+
+    with st.expander("Show model-level SHAP explainability for this task"):
         try:
             model = task_art.models[selected_model_name]
-            explainer = shap.TreeExplainer(model)
             sample_df = task_art.X_test_df.iloc[: min(120, len(task_art.X_test_df))]
-            shap_values = explainer(sample_df)
 
-            st.write("Global feature importance (mean absolute SHAP)")
-            fig1 = plt.figure()
-            shap.plots.bar(shap_values, max_display=15, show=False)
-            st.pyplot(fig1)
+            if hasattr(model, "feature_importances_"):
+                explainer = shap.TreeExplainer(model)
+                shap_values = explainer(sample_df)
+                st.write("Global feature importance")
+                fig1 = plt.figure()
+                shap.plots.bar(shap_values, max_display=15, show=False)
+                st.pyplot(fig1)
 
-            st.write("Beeswarm summary")
-            fig2 = plt.figure()
-            shap.plots.beeswarm(shap_values, max_display=15, show=False)
-            st.pyplot(fig2)
+                st.write("Beeswarm summary")
+                fig2 = plt.figure()
+                shap.plots.beeswarm(shap_values, max_display=15, show=False)
+                st.pyplot(fig2)
+            else:
+                st.info("Single-prediction SHAP is available in Live Prediction.")
         except Exception as exc:
             st.warning(f"SHAP could not be rendered here: {exc}")
+
+
+def create_patient_input(df: pd.DataFrame) -> pd.DataFrame:
+    def safe_choices(col: str, fallback: List[str]) -> List[str]:
+        if col in df.columns:
+            vals = [str(v) for v in df[col].dropna().unique() if str(v) not in ("nan", "None", "")]
+            vals = sorted(vals)
+            return vals if vals else fallback
+        return fallback
+
+    gender_opts = safe_choices("gender", ["Male", "Female", "Other"])
+    vacc_opts = safe_choices("vaccination_status", ["Booster", "Full", "Partial"])
+    variant_opts = safe_choices("variant", ["Alpha", "Delta", "Omicron"])
+    country_opts = safe_choices("country", ["Bangladesh", "India", "Pakistan", "USA"])[:25]
+    region_opts = safe_choices("region/state", ["Dhaka", "Sindh", "Chattogram"])[:25]
+    comor_opts = safe_choices("comorbidities", ["None", "Diabetes", "Hypertension", "Asthma", "Heart Disease"])
+    sym1_opts = safe_choices("symptoms_1", ["Fever", "Cough", "Shortness of Breath", "Fatigue"])
+    sym2_opts = safe_choices("symptoms_2", ["None", "Headache", "Loss of Smell", "Chest Pain"])
+    sym3_opts = safe_choices("symptoms_3", ["None", "Myalgia", "Nausea", "Diarrhoea"])
+    trt1_opts = safe_choices("treatment_given_1", ["Oxygen", "Remdesivir", "Steroids", "Paracetamol"])
+    trt2_opts = safe_choices("treatment_given_2", ["None", "Antibiotics", "Steroids"])
+    test_opts = safe_choices("test_type", ["PCR", "Antigen"])
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        age = st.slider("Age", 1, 100, 21)
+        gender = st.selectbox("Gender", gender_opts)
+        vaccination_status = st.selectbox("Vaccination Status", vacc_opts)
+        variant = st.selectbox("Variant", variant_opts)
+        country = st.selectbox("Country", country_opts)
+        region_state = st.selectbox("Region / State", region_opts)
+
+    with c2:
+        comorbidities = st.selectbox("Comorbidity", comor_opts)
+        symptoms_1 = st.selectbox("Symptom 1", sym1_opts)
+        symptoms_2 = st.selectbox("Symptom 2", sym2_opts)
+        symptoms_3 = st.selectbox("Symptom 3", sym3_opts)
+        tests_conducted = st.slider("Tests Conducted", 1, 15, 4)
+        hospitalized = st.checkbox("Hospitalized", value=True)
+
+    with c3:
+        test_type = st.selectbox("Test Type", test_opts)
+        treatment_given_1 = st.selectbox("Treatment 1", trt1_opts)
+        treatment_given_2 = st.selectbox("Treatment 2", trt2_opts)
+        ventilator_support = st.checkbox("Ventilator Support", value=True)
+
+    patient = pd.DataFrame(
+        [
+            {
+                "age": age,
+                "gender": gender,
+                "vaccination_status": vaccination_status,
+                "variant": variant,
+                "country": country,
+                "region/state": region_state,
+                "comorbidities": comorbidities,
+                "symptoms_1": symptoms_1,
+                "symptoms_2": symptoms_2,
+                "symptoms_3": symptoms_3,
+                "tests_conducted": tests_conducted,
+                "test_type": test_type,
+                "treatment_given_1": treatment_given_1,
+                "treatment_given_2": treatment_given_2,
+                "hospitalized": int(hospitalized),
+                "ventilator_support": int(ventilator_support),
+                "icu_admission": 0,
+                "death": 0,
+                "severity": np.nan,
+                "severity_progressed": 0,
+            }
+        ]
+    )
+
+    return add_post_admission_features(patient)
 
 
 st.sidebar.header("Setup")
@@ -965,6 +983,9 @@ uploaded_file = st.sidebar.file_uploader("Upload dataset CSV", type=["csv"]) if 
 
 if not HAS_XGBOOST:
     st.sidebar.warning("xgboost is not installed. XGBoost rows will be skipped.")
+
+if not HAS_SHAP:
+    st.sidebar.warning("shap is not installed. Live explanation will be skipped.")
 
 try:
     raw_df = load_data(DEFAULT_DATA_PATH, uploaded_file)
@@ -1049,7 +1070,6 @@ with balanced_tab:
         raw_work = raw_df.copy()
         if task_name in ["Severity", "Severity Progression"]:
             raw_work = add_post_admission_features(raw_work)
-            raw_work["severity_progressed"] = raw_work["severity"].isin(["Severe", "Critical"]).astype(int)
 
         c1, c2 = st.columns(2)
         with c1:
@@ -1144,7 +1164,6 @@ with training_tab:
         st.info("No model has been trained yet.")
     else:
         st.dataframe(summary_df.round(4), width="stretch")
-        plot_overall_comparison(summary_df)
 
     st.markdown("### Deep inspection")
     inspect_task = st.selectbox("Choose a task to inspect", [t for t in TASK_ORDER if t in artifacts], key="inspect_task")
@@ -1154,25 +1173,60 @@ with training_tab:
         st.info("Train at least one model for this task first.")
     else:
         st.dataframe(task_art.model_results[["Model", "Accuracy", "ROC-AUC"]].round(4), width="stretch")
-        plot_model_comparison(task_art)
-        plot_roc_for_task(task_art)
 
         inspect_model = st.selectbox(
             "Choose trained model to inspect",
             task_art.model_results["Model"].tolist(),
             key="inspect_model",
         )
+
         c1, c2 = st.columns(2)
         with c1:
-            plot_confusion_for_model(task_art, inspect_model)
+            row = task_art.model_results.loc[task_art.model_results["Model"] == inspect_model].iloc[0]
+            preds = row["Predictions"]
+            cm = confusion_matrix(task_art.y_test, preds)
+
+            labels = (
+                TASK_META[task_art.task_name]["display_classes"]
+                if task_art.is_binary
+                else list(task_art.label_encoder.classes_)
+            )
+
+            fig, ax = plt.subplots(figsize=(6, 5))
+            im = ax.imshow(cm)
+            ax.set_xticks(range(len(labels)))
+            ax.set_yticks(range(len(labels)))
+            ax.set_xticklabels(labels, rotation=25, ha="right")
+            ax.set_yticklabels(labels)
+            ax.set_xlabel("Predicted")
+            ax.set_ylabel("Actual")
+            ax.set_title(f"Confusion Matrix — {inspect_model}")
+            for i in range(cm.shape[0]):
+                for j in range(cm.shape[1]):
+                    ax.text(j, i, str(cm[i, j]), ha="center", va="center")
+            fig.colorbar(im, ax=ax)
+            st.pyplot(fig)
+
         with c2:
-            plot_feature_importance(task_art, inspect_model, top_n=15)
+            fi = (
+                task_art.feature_importance_df[task_art.feature_importance_df["Model"] == inspect_model]
+                .copy()
+                .sort_values("importance", ascending=False)
+                .head(15)
+            )
+            if fi.empty or float(fi["importance"].sum()) == 0:
+                st.info("Feature importance not available.")
+            else:
+                fig, ax = plt.subplots(figsize=(8, 5))
+                ax.barh(fi["feature"][::-1], fi["importance"][::-1])
+                ax.set_title(f"Top Features — {inspect_model}")
+                ax.set_xlabel("Importance")
+                st.pyplot(fig)
 
         optional_shap_section(task_art, inspect_model)
 
 with prediction_tab:
     st.subheader("Live Prediction")
-    st.write("Notebook-style live prediction with fixed default models for presentation.")
 
     patient_df = create_patient_input(raw_df)
 
@@ -1184,14 +1238,13 @@ with prediction_tab:
         trained_models = artifacts[task_name].model_results["Model"].tolist()
         with cols[idx % 4]:
             if trained_models:
-                fixed_default = notebook_default_model_name(artifacts[task_name])
+                default_model = best_model_name(artifacts[task_name])
                 chosen_models[task_name] = st.selectbox(
                     task_name,
                     trained_models,
-                    index=trained_models.index(fixed_default) if fixed_default in trained_models else 0,
+                    index=trained_models.index(default_model) if default_model in trained_models else 0,
                     key=f"pred_{task_name}",
                 )
-                st.caption(f"Default: {fixed_default}")
             else:
                 st.warning(f"No trained model yet for {task_name}")
 
@@ -1205,38 +1258,60 @@ with prediction_tab:
 
             icu_prob = results.get("ICU Escalation", {}).get("probability", 0.0)
             mort_prob = results.get("Mortality", {}).get("probability", 0.0)
-            severity_label = results.get("Severity", {}).get("label", "Unknown")
+            severity_label = results.get("Severity", {}).get("label", "Mild")
+
+            final_severity, severity_note = apply_consistency_rules(
+                severity_label=severity_label,
+                icu_prob=icu_prob,
+                mort_prob=mort_prob,
+                hospitalized=int(patient_df["hospitalized"].iloc[0]),
+                ventilator_support=int(patient_df["ventilator_support"].iloc[0]),
+            )
+            results["Severity"]["label"] = final_severity
+
+            severity_progression = "Progressed" if final_severity in ["Severe", "Critical"] else "Stable"
+            if "Severity Progression" in results:
+                results["Severity Progression"]["label"] = severity_progression
+
+            triage = triage_text(icu_prob, mort_prob, final_severity)
 
             st.markdown("### Prediction outputs")
-            metric_cols = st.columns(max(1, len(results)))
-            for i, task_name in enumerate(results.keys()):
-                out = results[task_name]
-                with metric_cols[i]:
-                    st.metric(task_name, out["label"], f"{out['probability'] * 100:.1f}%")
-                    st.caption(f"Model used: {chosen_models[task_name]}")
+            metric_cols = st.columns(4)
+
+            with metric_cols[0]:
+                icu_label = "ICU" if icu_prob >= 0.50 else "No ICU"
+                st.metric("ICU Escalation", icu_label, f"{icu_prob * 100:.1f}%")
+
+            with metric_cols[1]:
+                st.metric("Severity", final_severity, f"{results['Severity']['probability'] * 100:.1f}%")
+
+            with metric_cols[2]:
+                st.metric("Severity Progression", severity_progression)
+
+            with metric_cols[3]:
+                mort_label = "Died" if mort_prob >= 0.50 else "Survived"
+                st.metric("Mortality", mort_label, f"{mort_prob * 100:.1f}%")
 
             st.markdown("### Triage recommendation")
-            st.success(triage_text(icu_prob, mort_prob, severity_label))
+            st.success(triage)
+
+            if severity_note:
+                st.warning(severity_note)
 
             st.markdown("### Detailed probability tables")
-            for task_name, out in results.items():
-                st.markdown(f"#### {task_name}")
-                if TASK_META[task_name]["binary"]:
-                    prob_df = pd.DataFrame(
-                        {
-                            "Class": TASK_META[task_name]["display_classes"],
-                            "Probability": out["all_probabilities"],
-                        }
-                    )
-                else:
-                    prob_df = pd.DataFrame(
-                        {
-                            "Class": list(artifacts[task_name].label_encoder.classes_),
-                            "Probability": out["all_probabilities"],
-                        }
-                    )
-                st.dataframe(prob_df.round(4), width="stretch")
 
+            for task_name in ["ICU Escalation", "Mortality"]:
+                if task_name not in results:
+                    continue
+                out = results[task_name]
+                st.markdown(f"#### {task_name}")
+                prob_df = pd.DataFrame(
+                    {
+                        "Class": TASK_META[task_name]["display_classes"],
+                        "Probability": out["all_probabilities"],
+                    }
+                )
+                st.dataframe(prob_df.round(4), width="stretch")
                 fig, ax = plt.subplots(figsize=(7, 3.5))
                 ax.bar(prob_df["Class"], prob_df["Probability"])
                 ax.set_ylim(0, 1)
@@ -1244,8 +1319,46 @@ with prediction_tab:
                 ax.grid(True, alpha=0.25, axis="y")
                 st.pyplot(fig)
 
+            if "Severity" in results:
+                st.markdown("#### Severity")
+                sev_prob_df = pd.DataFrame(
+                    {
+                        "Class": list(artifacts["Severity"].label_encoder.classes_),
+                        "Probability": results["Severity"]["all_probabilities"],
+                    }
+                )
+                st.dataframe(sev_prob_df.round(4), width="stretch")
+                fig, ax = plt.subplots(figsize=(7, 3.5))
+                ax.bar(sev_prob_df["Class"], sev_prob_df["Probability"])
+                ax.set_ylim(0, 1)
+                ax.set_title("Severity probabilities")
+                ax.grid(True, alpha=0.25, axis="y")
+                st.pyplot(fig)
+
+            if "Severity" in results:
+                render_prediction_shap(
+                    "Severity",
+                    artifacts["Severity"],
+                    chosen_models["Severity"],
+                    patient_df,
+                    results["Severity"]["pred_idx"],
+                )
+            if "Mortality" in results:
+                render_prediction_shap(
+                    "Mortality",
+                    artifacts["Mortality"],
+                    chosen_models["Mortality"],
+                    patient_df,
+                    results["Mortality"]["pred_idx"],
+                )
+            if "ICU Escalation" in results:
+                render_prediction_shap(
+                    "ICU Escalation",
+                    artifacts["ICU Escalation"],
+                    chosen_models["ICU Escalation"],
+                    patient_df,
+                    results["ICU Escalation"]["pred_idx"],
+                )
+
     st.markdown("### Patient row used for prediction")
     st.dataframe(patient_df, width="stretch")
-
-st.markdown("---")
-st.caption("Presentation tip: reload, train all tasks + all models once, then use the fixed Random Forest defaults in Live Prediction.")
