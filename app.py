@@ -3,7 +3,7 @@ warnings.filterwarnings("ignore")
 
 import hashlib
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -41,13 +41,13 @@ except Exception:
 
 
 st.set_page_config(
-    page_title="COVID-19 Clinical Decision Support Presentation App",
+    page_title="COVID-19 Clinical Decision Support System",
     page_icon="🩺",
     layout="wide",
 )
 
-st.title("🩺 COVID-19 Clinical Decision Support Presentation App")
-st.caption("Presentation-ready frontend with EDA, balancing, per-task/per-model training, comparison, and live prediction.")
+st.title("🩺 COVID-19 Clinical Decision Support System")
+st.caption("Notebook-aligned Streamlit frontend for presentation.")
 
 DEFAULT_DATA_PATH = "COVID-19_RECOVERY_DATASET.csv"
 
@@ -64,33 +64,38 @@ IRRELEVANT_COLS = [
 ]
 
 SEV_ORDER = {"Mild": 0, "Moderate": 1, "Severe": 2, "Critical": 3}
-HIGH_RISK_COMORBIDITIES = {"Diabetes", "Heart Disease", "COPD", "Hypertension"}
-RESP_SYMPTOMS = {"Fever", "Cough", "Shortness of Breath", "Loss of Smell"}
-
+TASK_ORDER = ["ICU Escalation", "Severity", "Severity Progression", "Mortality"]
 MODEL_ORDER = ["Logistic Regression", "Random Forest", "XGBoost", "Neural Network"]
-TASK_ORDER = ["ICU Escalation", "Severity Progression", "Mortality", "Severity"]
 
 TASK_META = {
     "ICU Escalation": {
         "target_col": "icu_admission",
+        "binary": True,
         "display_classes": ["No ICU", "ICU"],
-        "binary": True,
-    },
-    "Severity Progression": {
-        "target_col": "severity_progressed",
-        "display_classes": ["Stable", "Progressed"],
-        "binary": True,
-    },
-    "Mortality": {
-        "target_col": "death",
-        "display_classes": ["Survived", "Died"],
-        "binary": True,
     },
     "Severity": {
         "target_col": "severity",
-        "display_classes": ["Mild", "Moderate", "Severe", "Critical"],
         "binary": False,
+        "display_classes": ["Mild", "Moderate", "Severe", "Critical"],
     },
+    "Severity Progression": {
+        "target_col": "severity_progressed",
+        "binary": True,
+        "display_classes": ["Stable", "Progressed"],
+    },
+    "Mortality": {
+        "target_col": "death",
+        "binary": True,
+        "display_classes": ["Survived", "Died"],
+    },
+}
+
+# Fixed notebook-style prediction defaults for presentation
+PREDICTION_MODEL_DEFAULTS = {
+    "ICU Escalation": "Random Forest",
+    "Severity": "Random Forest",
+    "Severity Progression": "Random Forest",
+    "Mortality": "Random Forest",
 }
 
 
@@ -128,6 +133,16 @@ def safe_ohe() -> OneHotEncoder:
         return OneHotEncoder(handle_unknown="ignore", sparse=False)
 
 
+def build_xgb_classifier(**kwargs):
+    if not HAS_XGBOOST:
+        raise RuntimeError("xgboost is not installed.")
+    try:
+        return XGBClassifier(**kwargs)
+    except TypeError:
+        kwargs.pop("use_label_encoder", None)
+        return XGBClassifier(**kwargs)
+
+
 def load_data(path: str, uploaded_file=None) -> pd.DataFrame:
     if uploaded_file is not None:
         df = pd.read_csv(uploaded_file)
@@ -139,26 +154,103 @@ def load_data(path: str, uploaded_file=None) -> pd.DataFrame:
             df[c] = df[c].astype(str).str.strip()
             df.loc[df[c].isin(["nan", "None", "NaN", ""]), c] = np.nan
 
-    bool_cols = ["hospitalized", "ventilator_support", "icu_admission", "death", "recovered"]
-    for col in bool_cols:
+    boolish_cols = ["hospitalized", "icu_admission", "ventilator_support", "recovered", "death"]
+    for col in boolish_cols:
+        if col in df.columns and df[col].dtype == "object":
+            lowered = df[col].astype(str).str.lower()
+            df[col] = lowered.map(
+                {
+                    "yes": 1,
+                    "true": 1,
+                    "1": 1,
+                    "1.0": 1,
+                    "no": 0,
+                    "false": 0,
+                    "0": 0,
+                    "0.0": 0,
+                }
+            ).where(~lowered.isin(["nan", "none"]), np.nan)
+
+    numeric_maybe = [
+        "age",
+        "hospitalized",
+        "icu_admission",
+        "ventilator_support",
+        "tests_conducted",
+        "recovered",
+        "death",
+    ]
+    for col in numeric_maybe:
         if col in df.columns:
-            if df[col].dtype == "object":
-                df[col] = (
-                    df[col].str.lower().map(
-                        {
-                            "yes": 1, "true": 1, "1": 1,
-                            "no": 0, "false": 0, "0": 0,
-                        }
-                    )
-                )
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    if "age" in df.columns:
-        df["age"] = pd.to_numeric(df["age"], errors="coerce")
-    if "tests_conducted" in df.columns:
-        df["tests_conducted"] = pd.to_numeric(df["tests_conducted"], errors="coerce")
-
     return df
+
+
+def plot_counts(series: pd.Series, title: str, rotation: int = 0):
+    counts = series.value_counts(dropna=False)
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.bar(counts.index.astype(str), counts.values)
+    ax.set_title(title)
+    ax.set_ylabel("Count")
+    ax.grid(True, alpha=0.25, axis="y")
+    plt.xticks(rotation=rotation, ha="right")
+    st.pyplot(fig)
+
+
+def balance_icu_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    work = df.dropna(subset=["icu_admission"]).copy()
+    work["icu_admission"] = pd.to_numeric(work["icu_admission"], errors="coerce")
+    work = work.dropna(subset=["icu_admission"])
+    work["icu_admission"] = work["icu_admission"].astype(int)
+
+    total_n = len(work)
+    target_per_class = int(total_n * 0.30 / 2)
+    target_per_class = max(50, target_per_class)
+
+    icu_no = work[work["icu_admission"] == 0]
+    icu_yes = work[work["icu_admission"] == 1]
+
+    if len(icu_no) == 0 or len(icu_yes) == 0:
+        return work.reset_index(drop=True)
+
+    icu_no_s = icu_no.sample(n=min(target_per_class, len(icu_no)), random_state=42)
+    icu_yes_s = icu_yes.sample(n=min(target_per_class, len(icu_yes)), random_state=42)
+
+    return pd.concat([icu_no_s, icu_yes_s]).sample(frac=1, random_state=42).reset_index(drop=True)
+
+
+def balance_mortality_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    work = df.dropna(subset=["death"]).copy()
+    work["death"] = pd.to_numeric(work["death"], errors="coerce")
+    work = work.dropna(subset=["death"])
+    work["death"] = work["death"].astype(int)
+
+    mort_no = work[work["death"] == 0]
+    mort_yes = work[work["death"] == 1]
+
+    if len(mort_no) == 0 or len(mort_yes) == 0:
+        return work.reset_index(drop=True)
+
+    minority_mort = min(len(mort_no), len(mort_yes))
+    mort_no_s = mort_no.sample(n=minority_mort, random_state=42)
+    mort_yes_s = mort_yes.sample(n=minority_mort, random_state=42)
+
+    return pd.concat([mort_no_s, mort_yes_s]).sample(frac=1, random_state=42).reset_index(drop=True)
+
+
+def balance_severity_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    work = df.dropna(subset=["severity"]).copy()
+    sev_counts = work["severity"].value_counts()
+    if sev_counts.empty:
+        return work.reset_index(drop=True)
+
+    minority_sev = int(sev_counts.min())
+    sev_samples = [
+        work[work["severity"] == klass].sample(n=minority_sev, random_state=42)
+        for klass in sev_counts.index
+    ]
+    return pd.concat(sev_samples).sample(frac=1, random_state=42).reset_index(drop=True)
 
 
 def add_post_admission_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -169,36 +261,38 @@ def add_post_admission_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["severity_score"] = 0
 
+    high_risk = {"Diabetes", "Heart Disease", "COPD", "Hypertension"}
     if "comorbidities" in df.columns:
-        df["comorbidity_risk"] = df["comorbidities"].isin(HIGH_RISK_COMORBIDITIES).astype(int)
+        df["comorbidity_risk"] = df["comorbidities"].isin(high_risk).astype(int)
     else:
         df["comorbidity_risk"] = 0
 
     symptom_cols = [c for c in ["symptoms_1", "symptoms_2", "symptoms_3"] if c in df.columns]
     if symptom_cols:
         df["symptom_count"] = df[symptom_cols].notna().sum(axis=1).astype(int)
-
-        def respiratory_flag(row) -> int:
-            vals = {str(row.get(c, "")) for c in symptom_cols}
-            return int(any(v in RESP_SYMPTOMS for v in vals))
-
-        df["has_respiratory"] = df.apply(respiratory_flag, axis=1)
+        resp = {"Fever", "Cough", "Shortness of Breath", "Loss of Smell"}
+        df["has_respiratory"] = (
+            df.get("symptoms_1", pd.Series(index=df.index)).isin(resp)
+            | df.get("symptoms_2", pd.Series(index=df.index)).isin(resp)
+            | df.get("symptoms_3", pd.Series(index=df.index)).isin(resp)
+        ).astype(int)
     else:
         df["symptom_count"] = 0
         df["has_respiratory"] = 0
 
     if "age" in df.columns:
-        df["age_x_comorbidity"] = pd.to_numeric(df["age"], errors="coerce").fillna(0) * df["comorbidity_risk"]
-        age_group = pd.cut(
-            pd.to_numeric(df["age"], errors="coerce").fillna(0),
+        age_num = pd.to_numeric(df["age"], errors="coerce")
+        age_bins = pd.cut(
+            age_num,
             bins=[0, 40, 60, 80, 120],
             labels=["Young", "Middle", "Senior", "Elderly"],
             include_lowest=True,
         )
-        df["age_group"] = age_group.astype(object).where(age_group.notna(), "Middle")
+        df["age_group"] = age_bins.astype(object).where(age_bins.notna(), "Middle")
+        df["age_x_comorbidity"] = age_num.fillna(0) * df["comorbidity_risk"]
     else:
-        df["age_x_comorbidity"] = 0
         df["age_group"] = "Middle"
+        df["age_x_comorbidity"] = 0
 
     if "icu_admission" in df.columns:
         df["sev_x_icu"] = df["severity_score"] * pd.to_numeric(df["icu_admission"], errors="coerce").fillna(0)
@@ -216,129 +310,164 @@ def add_post_admission_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def plot_counts(series: pd.Series, title: str, rotation: int = 0):
-    counts = series.value_counts(dropna=False)
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.bar(counts.index.astype(str), counts.values)
-    ax.set_title(title)
-    ax.set_ylabel("Count")
-    ax.grid(True, alpha=0.25, axis="y")
-    plt.xticks(rotation=rotation, ha="right")
-    st.pyplot(fig)
+def get_feature_cols(df_data: pd.DataFrame, target_col: str) -> List[str]:
+    exclude = set(IRRELEVANT_COLS + [target_col])
+
+    if target_col == "icu_admission":
+        exclude.update(
+            [
+                "death",
+                "mortality",
+                "severity_progressed",
+                "severity",
+                "severity_score",
+                "sev_x_icu",
+                "sev_x_vent",
+                "ventilator_support",
+            ]
+        )
+    elif target_col == "severity_progressed":
+        exclude.update(
+            [
+                "death",
+                "mortality",
+                "severity",
+                "severity_score",
+                "sev_x_icu",
+                "sev_x_vent",
+                "ventilator_support",
+                "icu_admission",
+            ]
+        )
+    elif target_col == "death":
+        exclude.update(["mortality", "severity_progressed"])
+    elif target_col == "severity":
+        # IMPORTANT: notebook-style generic severity flow
+        exclude.update(["severity_progressed", "severity_score"])
+
+    return [c for c in df_data.columns if c not in exclude]
 
 
 def build_preprocessor(X: pd.DataFrame) -> Tuple[ColumnTransformer, List[str], List[str]]:
     cat_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()
     num_cols = X.select_dtypes(exclude=["object", "category"]).columns.tolist()
 
-    cat_pipe = Pipeline([
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("ohe", safe_ohe()),
-    ])
-    num_pipe = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
-    ])
+    cat_pipe = Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("ohe", safe_ohe()),
+        ]
+    )
+    num_pipe = Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]
+    )
 
-    preprocessor = ColumnTransformer([
-        ("cat", cat_pipe, cat_cols),
-        ("num", num_pipe, num_cols),
-    ], remainder="drop")
-
+    preprocessor = ColumnTransformer(
+        [
+            ("cat", cat_pipe, cat_cols),
+            ("num", num_pipe, num_cols),
+        ],
+        remainder="drop",
+    )
     return preprocessor, cat_cols, num_cols
 
 
-def get_feature_cols(df_data: pd.DataFrame, target_col: str) -> List[str]:
-    exclude = set(IRRELEVANT_COLS + [target_col])
+def get_model_factories(task_name: str) -> Dict[str, object]:
+    meta = TASK_META[task_name]
+    is_binary = meta["binary"]
 
-    if target_col == "icu_admission":
-        exclude.update(["death", "severity_progressed", "severity", "severity_score", "sev_x_icu", "sev_x_vent"])
-    elif target_col == "severity_progressed":
-        exclude.update(["death", "icu_admission", "severity", "severity_score", "sev_x_icu", "sev_x_vent"])
-    elif target_col == "death":
-        exclude.update(["severity_progressed"])
-    elif target_col == "severity":
-        exclude.update(["severity_progressed", "severity_score"])
-
-    return [c for c in df_data.columns if c not in exclude]
-
-
-def balance_binary_dataset(df: pd.DataFrame, target_col: str, fraction_of_total: float = 0.30, seed: int = 42) -> pd.DataFrame:
-    work = df.dropna(subset=[target_col]).copy()
-    work[target_col] = pd.to_numeric(work[target_col], errors="coerce")
-    work = work.dropna(subset=[target_col])
-    work[target_col] = work[target_col].astype(int)
-
-    class0 = work[work[target_col] == 0]
-    class1 = work[work[target_col] == 1]
-
-    if len(class0) == 0 or len(class1) == 0:
-        return work.copy()
-
-    target_per_class = int(len(work) * fraction_of_total / 2)
-    target_per_class = max(50, target_per_class)
-
-    s0 = class0.sample(n=min(target_per_class, len(class0)), random_state=seed)
-    s1 = class1.sample(n=min(target_per_class, len(class1)), random_state=seed)
-
-    return pd.concat([s0, s1]).sample(frac=1, random_state=seed).reset_index(drop=True)
-
-
-def balance_multiclass_dataset(df: pd.DataFrame, target_col: str, per_class: int = 300, seed: int = 42) -> pd.DataFrame:
-    work = df.dropna(subset=[target_col]).copy()
-    pieces = []
-    for klass in work[target_col].dropna().unique():
-        sub = work[work[target_col] == klass]
-        pieces.append(sub.sample(n=min(per_class, len(sub)), random_state=seed))
-    if not pieces:
-        return work
-    return pd.concat(pieces).sample(frac=1, random_state=seed).reset_index(drop=True)
-
-
-def get_model_factories(is_binary: bool) -> Dict[str, object]:
-    models = {
-        "Logistic Regression": LogisticRegression(
-            max_iter=2000,
-            C=0.5,
-            class_weight="balanced" if is_binary else None,
-            random_state=42,
-            solver="lbfgs",
-        ),
-        "Random Forest": RandomForestClassifier(
-            n_estimators=300,
-            max_depth=10 if is_binary else 12,
-            min_samples_split=10 if is_binary else 2,
-            min_samples_leaf=4 if is_binary else 1,
-            class_weight="balanced",
-            random_state=42,
-            n_jobs=-1,
-        ),
-        "Neural Network": MLPClassifier(
-            hidden_layer_sizes=(256, 128, 64),
-            activation="relu",
-            solver="adam",
-            alpha=0.001,
-            learning_rate_init=0.001,
-            max_iter=300,
-            random_state=42,
-        ),
-    }
-
-    if HAS_XGBOOST:
-        xgb_params = dict(
-            n_estimators=300,
-            max_depth=5 if is_binary else 6,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_weight=5,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
-            eval_metric="logloss" if is_binary else "mlogloss",
-            random_state=42,
-            n_jobs=-1,
-        )
-        models["XGBoost"] = XGBClassifier(**xgb_params)
+    if task_name == "Severity":
+        models = {
+            "Logistic Regression": LogisticRegression(
+                max_iter=2000,
+                random_state=42,
+                solver="lbfgs",
+            ),
+            "Random Forest": RandomForestClassifier(
+                n_estimators=200,
+                max_depth=15,
+                min_samples_split=10,
+                min_samples_leaf=4,
+                random_state=42,
+                n_jobs=-1,
+            ),
+            "Neural Network": MLPClassifier(
+                hidden_layer_sizes=(128, 64, 32),
+                activation="relu",
+                solver="adam",
+                alpha=0.001,
+                batch_size=256,
+                learning_rate="adaptive",
+                learning_rate_init=0.001,
+                max_iter=500,
+                random_state=42,
+                early_stopping=True,
+                validation_fraction=0.1,
+                n_iter_no_change=20,
+            ),
+        }
+        if HAS_XGBOOST:
+            models["XGBoost"] = build_xgb_classifier(
+                n_estimators=200,
+                max_depth=8,
+                learning_rate=0.1,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=42,
+                eval_metric="mlogloss",
+                use_label_encoder=False,
+                n_jobs=-1,
+            )
+    else:
+        models = {
+            "Logistic Regression": LogisticRegression(
+                max_iter=2000,
+                C=0.5,
+                class_weight="balanced" if is_binary else None,
+                random_state=42,
+                solver="lbfgs",
+            ),
+            "Random Forest": RandomForestClassifier(
+                n_estimators=300,
+                max_depth=10,
+                min_samples_split=10,
+                min_samples_leaf=4,
+                class_weight="balanced",
+                random_state=42,
+                n_jobs=-1,
+            ),
+            "Neural Network": MLPClassifier(
+                hidden_layer_sizes=(256, 128, 64),
+                activation="relu",
+                solver="adam",
+                alpha=0.001,
+                batch_size=256,
+                learning_rate="adaptive",
+                learning_rate_init=0.001,
+                max_iter=500,
+                random_state=42,
+                early_stopping=True,
+                validation_fraction=0.1,
+                n_iter_no_change=20,
+            ),
+        }
+        if HAS_XGBOOST:
+            models["XGBoost"] = build_xgb_classifier(
+                n_estimators=300,
+                max_depth=5,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                min_child_weight=5,
+                reg_alpha=0.1,
+                reg_lambda=1.0,
+                eval_metric="logloss",
+                random_state=42,
+                n_jobs=-1,
+            )
 
     ordered = {}
     for name in MODEL_ORDER:
@@ -380,15 +509,20 @@ def evaluate_model(
 def feature_importance_from_model(model, feature_names: List[str]) -> pd.DataFrame:
     if hasattr(model, "feature_importances_"):
         vals = model.feature_importances_
-        return pd.DataFrame({"feature": feature_names, "importance": vals}).sort_values("importance", ascending=False)
+        return (
+            pd.DataFrame({"feature": feature_names, "importance": vals})
+            .sort_values("importance", ascending=False)
+            .reset_index(drop=True)
+        )
 
     if hasattr(model, "coef_"):
         coef = model.coef_
-        if np.ndim(coef) == 1:
-            vals = np.abs(coef)
-        else:
-            vals = np.abs(coef).mean(axis=0)
-        return pd.DataFrame({"feature": feature_names, "importance": vals}).sort_values("importance", ascending=False)
+        vals = np.abs(coef).mean(axis=0) if np.ndim(coef) > 1 else np.abs(coef)
+        return (
+            pd.DataFrame({"feature": feature_names, "importance": vals})
+            .sort_values("importance", ascending=False)
+            .reset_index(drop=True)
+        )
 
     return pd.DataFrame({"feature": feature_names, "importance": np.zeros(len(feature_names))})
 
@@ -410,11 +544,16 @@ def build_task_base(df_task: pd.DataFrame, task_name: str) -> TaskArtifacts:
         label_encoder = LabelEncoder()
         y = label_encoder.fit_transform(data[target_col].astype(str))
 
+    # CRITICAL FIX: use generic notebook-style feature selector for Severity too
     feature_cols_raw = get_feature_cols(data, target_col)
     X_raw = data[feature_cols_raw].copy()
 
     X_train_raw, X_test_raw, y_train, y_test = train_test_split(
-        X_raw, y, test_size=0.20, random_state=42, stratify=y
+        X_raw,
+        y,
+        test_size=0.20,
+        random_state=42,
+        stratify=y,
     )
 
     preprocessor, cat_cols, num_cols = build_preprocessor(X_train_raw)
@@ -422,7 +561,7 @@ def build_task_base(df_task: pd.DataFrame, task_name: str) -> TaskArtifacts:
     X_test_processed = preprocessor.transform(X_test_raw)
 
     ohe_features = []
-    if len(cat_cols) > 0:
+    if cat_cols:
         ohe_features = list(preprocessor.named_transformers_["cat"]["ohe"].get_feature_names_out(cat_cols))
     feature_names = ohe_features + num_cols
 
@@ -446,16 +585,18 @@ def build_task_base(df_task: pd.DataFrame, task_name: str) -> TaskArtifacts:
         X_test_raw=X_test_raw,
         feature_columns_raw=feature_cols_raw,
         balanced_df=data,
-        model_results=pd.DataFrame(columns=["Model", "Accuracy", "ROC-AUC", "Predictions", "Probabilities", "Report"]),
+        model_results=pd.DataFrame(
+            columns=["Model", "Accuracy", "ROC-AUC", "Predictions", "Probabilities", "Report"]
+        ),
         models={},
         feature_importance_df=pd.DataFrame(columns=["feature", "importance", "Model"]),
     )
 
 
 def train_one_model_for_task(task_art: TaskArtifacts, model_name: str) -> TaskArtifacts:
-    model_factories = get_model_factories(task_art.is_binary)
+    model_factories = get_model_factories(task_art.task_name)
     if model_name not in model_factories:
-        raise ValueError(f"Model {model_name} is not available.")
+        raise ValueError(f"Model {model_name} is not available for {task_art.task_name}.")
 
     outcome = evaluate_model(
         model_factories[model_name],
@@ -468,17 +609,25 @@ def train_one_model_for_task(task_art: TaskArtifacts, model_name: str) -> TaskAr
 
     task_art.models[model_name] = outcome["model"]
 
-    new_row = pd.DataFrame([{
-        "Model": model_name,
-        "Accuracy": outcome["accuracy"],
-        "ROC-AUC": outcome["roc_auc"],
-        "Predictions": outcome["preds"],
-        "Probabilities": outcome["probs"],
-        "Report": outcome["report"],
-    }])
+    new_row = pd.DataFrame(
+        [
+            {
+                "Model": model_name,
+                "Accuracy": outcome["accuracy"],
+                "ROC-AUC": outcome["roc_auc"],
+                "Predictions": outcome["preds"],
+                "Probabilities": outcome["probs"],
+                "Report": outcome["report"],
+            }
+        ]
+    )
 
     existing = task_art.model_results[task_art.model_results["Model"] != model_name].copy()
-    task_art.model_results = pd.concat([existing, new_row], ignore_index=True).sort_values("ROC-AUC", ascending=False).reset_index(drop=True)
+    task_art.model_results = (
+        pd.concat([existing, new_row], ignore_index=True)
+        .sort_values("ROC-AUC", ascending=False)
+        .reset_index(drop=True)
+    )
 
     fi = feature_importance_from_model(outcome["model"], task_art.feature_names)
     fi["Model"] = model_name
@@ -489,24 +638,19 @@ def train_one_model_for_task(task_art: TaskArtifacts, model_name: str) -> TaskAr
 
 
 def prepare_all_task_datasets(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    df_work = add_post_admission_features(df.copy())
-
-    if "severity" in df_work.columns:
-        df_work["severity_progressed"] = df_work["severity"].isin(["Severe", "Critical"]).astype(int)
-
     datasets = {}
-    if "icu_admission" in df_work.columns:
-        datasets["ICU Escalation"] = balance_binary_dataset(df_work, "icu_admission", fraction_of_total=0.30)
 
-    if "severity" in df_work.columns:
-        sev_bal = balance_multiclass_dataset(df_work, "severity", per_class=300)
-        sev_bal = add_post_admission_features(sev_bal)
+    if "icu_admission" in df.columns:
+        datasets["ICU Escalation"] = add_post_admission_features(balance_icu_dataset(df.copy()))
+
+    if "death" in df.columns:
+        datasets["Mortality"] = add_post_admission_features(balance_mortality_dataset(df.copy()))
+
+    if "severity" in df.columns:
+        sev_bal = add_post_admission_features(balance_severity_dataset(df.copy()))
         sev_bal["severity_progressed"] = sev_bal["severity"].isin(["Severe", "Critical"]).astype(int)
         datasets["Severity"] = sev_bal
         datasets["Severity Progression"] = sev_bal.copy()
-
-    if "death" in df_work.columns:
-        datasets["Mortality"] = balance_binary_dataset(df_work, "death", fraction_of_total=0.30)
 
     return datasets
 
@@ -517,19 +661,30 @@ def overall_summary_from_artifacts(artifacts: Dict[str, TaskArtifacts]) -> pd.Da
         if task_name not in artifacts:
             continue
         for _, row in artifacts[task_name].model_results.iterrows():
-            rows.append({
-                "Task": task_name,
-                "Model": row["Model"],
-                "Accuracy": row["Accuracy"],
-                "ROC-AUC": row["ROC-AUC"],
-            })
+            rows.append(
+                {
+                    "Task": task_name,
+                    "Model": row["Model"],
+                    "Accuracy": row["Accuracy"],
+                    "ROC-AUC": row["ROC-AUC"],
+                }
+            )
     return pd.DataFrame(rows)
 
 
 def best_model_name(task_art: TaskArtifacts) -> Optional[str]:
     if task_art.model_results.empty:
         return None
-    return task_art.model_results.iloc[0]["Model"]
+    return str(task_art.model_results.iloc[0]["Model"])
+
+
+def notebook_default_model_name(task_art: TaskArtifacts) -> Optional[str]:
+    preferred = PREDICTION_MODEL_DEFAULTS.get(task_art.task_name, "Random Forest")
+    if preferred in task_art.models:
+        return preferred
+    if task_art.model_results.empty:
+        return None
+    return str(task_art.model_results.iloc[0]["Model"])
 
 
 def create_patient_input(df: pd.DataFrame) -> pd.DataFrame:
@@ -537,27 +692,27 @@ def create_patient_input(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             vals = [str(v) for v in df[col].dropna().unique() if str(v) not in ("nan", "None", "")]
             vals = sorted(vals)
-            return vals[:50] if vals else fallback
+            return vals if vals else fallback
         return fallback
 
     gender_opts = safe_choices("gender", ["Male", "Female", "Other"])
-    vacc_opts = safe_choices("vaccination_status", ["Vaccinated", "Unvaccinated", "Partially Vaccinated"])
-    variant_opts = safe_choices("variant", ["Delta", "Omicron", "Alpha", "Beta", "Other"])
-    country_opts = safe_choices("country", ["Bangladesh", "India", "USA", "UK"])
-    region_opts = safe_choices("region/state", ["Dhaka", "Chattogram", "Sylhet"])
-    comor_opts = safe_choices("comorbidities", ["None", "Diabetes", "Hypertension", "Heart Disease"])
+    vacc_opts = safe_choices("vaccination_status", ["Booster", "Full", "Partial"])
+    variant_opts = safe_choices("variant", ["Alpha", "Delta", "Omicron"])
+    country_opts = safe_choices("country", ["Bangladesh", "India", "Pakistan", "USA"])[:25]
+    region_opts = safe_choices("region/state", ["Dhaka", "Sindh", "Chattogram"])[:25]
+    comor_opts = safe_choices("comorbidities", ["None", "Diabetes", "Hypertension", "Asthma", "Heart Disease"])
     sym1_opts = safe_choices("symptoms_1", ["Fever", "Cough", "Shortness of Breath", "Fatigue"])
     sym2_opts = safe_choices("symptoms_2", ["None", "Headache", "Loss of Smell", "Chest Pain"])
     sym3_opts = safe_choices("symptoms_3", ["None", "Myalgia", "Nausea", "Diarrhoea"])
-    trt1_opts = safe_choices("treatment_given_1", ["Oxygen", "Remdesivir", "Dexamethasone", "Supportive"])
-    trt2_opts = safe_choices("treatment_given_2", ["None", "Tocilizumab", "Plasma", "Antiviral"])
-    test_opts = safe_choices("test_type", ["PCR", "Rapid Antigen", "Antibody"])
-    severity_opts = safe_choices("severity", ["Mild", "Moderate", "Severe", "Critical"])
+    trt1_opts = safe_choices("treatment_given_1", ["Oxygen", "Remdesivir", "Steroids", "Paracetamol"])
+    trt2_opts = safe_choices("treatment_given_2", ["None", "Antibiotics", "Steroids"])
+    test_opts = safe_choices("test_type", ["PCR", "Antigen"])
+    severity_opts = ["Mild", "Moderate", "Severe", "Critical"]
 
     c1, c2, c3 = st.columns(3)
 
     with c1:
-        age = st.slider("Age", 1, 100, 55)
+        age = st.slider("Age", 1, 100, 21)
         gender = st.selectbox("Gender", gender_opts)
         vaccination_status = st.selectbox("Vaccination Status", vacc_opts)
         variant = st.selectbox("Variant", variant_opts)
@@ -569,40 +724,46 @@ def create_patient_input(df: pd.DataFrame) -> pd.DataFrame:
         symptoms_1 = st.selectbox("Symptom 1", sym1_opts)
         symptoms_2 = st.selectbox("Symptom 2", sym2_opts)
         symptoms_3 = st.selectbox("Symptom 3", sym3_opts)
-        severity = st.selectbox("Current Severity", severity_opts)
-        tests_conducted = st.slider("Tests Conducted", 1, 15, 2)
+        severity = st.selectbox("Current Severity", severity_opts, index=2)
+        tests_conducted = st.slider("Tests Conducted", 1, 15, 4)
 
     with c3:
         test_type = st.selectbox("Test Type", test_opts)
         treatment_given_1 = st.selectbox("Treatment 1", trt1_opts)
         treatment_given_2 = st.selectbox("Treatment 2", trt2_opts)
         hospitalized = st.checkbox("Hospitalized", value=True)
-        ventilator_support = st.checkbox("Ventilator Support", value=False)
+        ventilator_support = st.checkbox("Ventilator Support", value=True)
         icu_admission = st.checkbox("Already in ICU", value=False)
 
-    patient = pd.DataFrame([{
-        "age": age,
-        "gender": gender,
-        "vaccination_status": vaccination_status,
-        "variant": variant,
-        "country": country,
-        "region/state": region_state,
-        "comorbidities": comorbidities,
-        "symptoms_1": symptoms_1,
-        "symptoms_2": symptoms_2,
-        "symptoms_3": symptoms_3,
-        "severity": severity,
-        "tests_conducted": tests_conducted,
-        "test_type": test_type,
-        "treatment_given_1": treatment_given_1,
-        "treatment_given_2": treatment_given_2,
-        "hospitalized": int(hospitalized),
-        "ventilator_support": int(ventilator_support),
-        "icu_admission": int(icu_admission),
-        "death": 0,
-    }])
+    patient = pd.DataFrame(
+        [
+            {
+                "age": age,
+                "gender": gender,
+                "vaccination_status": vaccination_status,
+                "variant": variant,
+                "country": country,
+                "region/state": region_state,
+                "comorbidities": comorbidities,
+                "symptoms_1": symptoms_1,
+                "symptoms_2": symptoms_2,
+                "symptoms_3": symptoms_3,
+                "severity": severity,
+                "tests_conducted": tests_conducted,
+                "test_type": test_type,
+                "treatment_given_1": treatment_given_1,
+                "treatment_given_2": treatment_given_2,
+                "hospitalized": int(hospitalized),
+                "ventilator_support": int(ventilator_support),
+                "icu_admission": int(icu_admission),
+                "death": 0,
+            }
+        ]
+    )
 
-    return add_post_admission_features(patient)
+    patient = add_post_admission_features(patient)
+    patient["severity_progressed"] = patient["severity"].isin(["Severe", "Critical"]).astype(int)
+    return patient
 
 
 def align_patient_to_task(patient_df: pd.DataFrame, task_art: TaskArtifacts) -> pd.DataFrame:
@@ -627,7 +788,7 @@ def predict_for_task(task_art: TaskArtifacts, patient_df: pd.DataFrame, model_na
         label = TASK_META[task_art.task_name]["display_classes"][pred_idx]
         prob = float(probs[0, 1])
     else:
-        label = task_art.label_encoder.inverse_transform([pred_idx])[0]
+        label = str(task_art.label_encoder.inverse_transform([pred_idx])[0])
         prob = float(np.max(probs[0]))
 
     return {
@@ -679,7 +840,7 @@ def plot_roc_for_task(task_art: TaskArtifacts):
     for _, row in task_art.model_results.iterrows():
         probs = row["Probabilities"][:, 1]
         fpr, tpr, _ = roc_curve(task_art.y_test, probs)
-        ax.plot(fpr, tpr, label=f"{row['Model']} (AUC={row['ROC-AUC']:.3f})")
+        ax.plot(fpr, tpr, label=f"{row['Model']} (AUC={row['ROC-AUC']:.4f})")
     ax.plot([0, 1], [0, 1], linestyle="--")
     ax.set_title(f"{task_art.task_name} — ROC Curves")
     ax.set_xlabel("False Positive Rate")
@@ -698,7 +859,11 @@ def plot_confusion_for_model(task_art: TaskArtifacts, model_name: str):
     preds = row["Predictions"]
     cm = confusion_matrix(task_art.y_test, preds)
 
-    labels = TASK_META[task_art.task_name]["display_classes"] if task_art.is_binary else list(task_art.label_encoder.classes_)
+    labels = (
+        TASK_META[task_art.task_name]["display_classes"]
+        if task_art.is_binary
+        else list(task_art.label_encoder.classes_)
+    )
 
     fig, ax = plt.subplots(figsize=(6, 5))
     im = ax.imshow(cm)
@@ -721,8 +886,12 @@ def plot_feature_importance(task_art: TaskArtifacts, model_name: str, top_n: int
         st.info("No feature importance available yet.")
         return
 
-    fi = task_art.feature_importance_df
-    fi = fi[fi["Model"] == model_name].copy().sort_values("importance", ascending=False).head(top_n)
+    fi = (
+        task_art.feature_importance_df[task_art.feature_importance_df["Model"] == model_name]
+        .copy()
+        .sort_values("importance", ascending=False)
+        .head(top_n)
+    )
     if fi.empty or float(fi["importance"].sum()) == 0:
         st.info(f"{model_name} does not expose straightforward feature importances for display here.")
         return
@@ -794,6 +963,9 @@ st.sidebar.header("Setup")
 data_mode = st.sidebar.radio("Dataset source", ["Use local CSV file", "Upload CSV manually"])
 uploaded_file = st.sidebar.file_uploader("Upload dataset CSV", type=["csv"]) if data_mode == "Upload CSV manually" else None
 
+if not HAS_XGBOOST:
+    st.sidebar.warning("xgboost is not installed. XGBoost rows will be skipped.")
+
 try:
     raw_df = load_data(DEFAULT_DATA_PATH, uploaded_file)
     st.sidebar.success(f"Dataset loaded: {len(raw_df):,} rows")
@@ -823,21 +995,31 @@ overview_tab, eda_tab, balanced_tab, training_tab, prediction_tab = st.tabs(
 )
 
 with overview_tab:
-    st.markdown("""
+    st.subheader("Dataset Preview")
+    st.dataframe(raw_df.head(10), width="stretch")
 
-    """)
-    st.dataframe(raw_df.head(10), use_container_width=True)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if "icu_admission" in raw_df.columns:
+            st.metric("ICU positives", int((raw_df["icu_admission"] == 1).sum()))
+    with c2:
+        if "death" in raw_df.columns:
+            st.metric("Deaths", int((raw_df["death"] == 1).sum()))
+    with c3:
+        if "severity" in raw_df.columns:
+            st.metric("Severity classes", int(raw_df["severity"].nunique(dropna=True)))
 
 with eda_tab:
     st.subheader("Exploratory Data Analysis")
-    c1, c2 = st.columns(2)
+    col1, col2 = st.columns(2)
 
-    with c1:
+    with col1:
         if "severity" in raw_df.columns:
             plot_counts(raw_df["severity"], "Severity Distribution")
         if "icu_admission" in raw_df.columns:
             plot_counts(raw_df["icu_admission"], "ICU Admission Distribution")
-    with c2:
+
+    with col2:
         if "death" in raw_df.columns:
             plot_counts(raw_df["death"], "Mortality Distribution")
         if "variant" in raw_df.columns:
@@ -849,22 +1031,29 @@ with balanced_tab:
     st.subheader("Balanced Dataset Creation")
     rows = []
     for task_name, df_task in task_datasets.items():
-        rows.append({
-            "Task": task_name,
-            "Rows in balanced set": len(df_task),
-            "Target column": TASK_META[task_name]["target_col"],
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        rows.append(
+            {
+                "Task": task_name,
+                "Rows in balanced set": len(df_task),
+                "Target column": TASK_META[task_name]["target_col"],
+            }
+        )
+    st.dataframe(pd.DataFrame(rows), width="stretch")
 
     for task_name in TASK_ORDER:
         if task_name not in task_datasets:
             continue
         st.markdown(f"#### {task_name}")
         target_col = TASK_META[task_name]["target_col"]
+
+        raw_work = raw_df.copy()
+        if task_name in ["Severity", "Severity Progression"]:
+            raw_work = add_post_admission_features(raw_work)
+            raw_work["severity_progressed"] = raw_work["severity"].isin(["Severe", "Critical"]).astype(int)
+
         c1, c2 = st.columns(2)
         with c1:
             st.write("Raw distribution")
-            raw_work = add_post_admission_features(raw_df.copy())
             if target_col in raw_work.columns:
                 plot_counts(raw_work[target_col], f"Raw — {target_col}")
         with c2:
@@ -881,31 +1070,32 @@ with training_tab:
         if st.button("Train all tasks + all models", type="primary"):
             progress = st.progress(0, text="Starting training...")
             available_tasks = [t for t in TASK_ORDER if t in artifacts]
-            total_steps = sum(len(get_model_factories(artifacts[t].is_binary)) for t in available_tasks)
+            total_steps = sum(len(get_model_factories(t)) for t in available_tasks)
             step = 0
             for task_name in available_tasks:
-                for model_name in get_model_factories(artifacts[task_name].is_binary).keys():
+                for model_name in get_model_factories(task_name).keys():
                     artifacts[task_name] = train_one_model_for_task(artifacts[task_name], model_name)
                     step += 1
                     progress.progress(int(step / total_steps * 100), text=f"Training {task_name} — {model_name}")
             st.success("All tasks and all models trained.")
 
     with col_b:
-        st.write("Status")
         status_rows = []
         for task_name in TASK_ORDER:
             if task_name not in artifacts:
                 continue
-            status_rows.append({
-                "Task": task_name,
-                "Trained models": len(artifacts[task_name].models),
-                "Available models": len(get_model_factories(artifacts[task_name].is_binary)),
-            })
-        st.dataframe(pd.DataFrame(status_rows), use_container_width=True)
+            status_rows.append(
+                {
+                    "Task": task_name,
+                    "Trained models": len(artifacts[task_name].models),
+                    "Available models": len(get_model_factories(task_name)),
+                }
+            )
+        st.dataframe(pd.DataFrame(status_rows), width="stretch")
 
     st.markdown("### Individual training")
     train_task = st.selectbox("Choose task", [t for t in TASK_ORDER if t in artifacts], key="ind_train_task")
-    available_model_names = list(get_model_factories(artifacts[train_task].is_binary).keys())
+    available_model_names = list(get_model_factories(train_task).keys())
     train_model_name = st.selectbox("Choose model", available_model_names, key="ind_train_model")
 
     c1, c2 = st.columns(2)
@@ -929,22 +1119,31 @@ with training_tab:
             continue
         best_name = best_model_name(artifacts[task_name])
         if best_name is None:
-            best_rows.append({"Task": task_name, "Best trained model": "None yet", "Accuracy": np.nan, "ROC-AUC": np.nan})
+            best_rows.append(
+                {
+                    "Task": task_name,
+                    "Best trained model": "None yet",
+                    "Accuracy": np.nan,
+                    "ROC-AUC": np.nan,
+                }
+            )
         else:
             row = artifacts[task_name].model_results.iloc[0]
-            best_rows.append({
-                "Task": task_name,
-                "Best trained model": best_name,
-                "Accuracy": row["Accuracy"],
-                "ROC-AUC": row["ROC-AUC"],
-            })
-    st.dataframe(pd.DataFrame(best_rows).round(4), use_container_width=True)
+            best_rows.append(
+                {
+                    "Task": task_name,
+                    "Best trained model": best_name,
+                    "Accuracy": row["Accuracy"],
+                    "ROC-AUC": row["ROC-AUC"],
+                }
+            )
+    st.dataframe(pd.DataFrame(best_rows).round(4), width="stretch")
 
     st.markdown("### Overall trained-model comparison")
     if summary_df.empty:
         st.info("No model has been trained yet.")
     else:
-        st.dataframe(summary_df.round(4), use_container_width=True)
+        st.dataframe(summary_df.round(4), width="stretch")
         plot_overall_comparison(summary_df)
 
     st.markdown("### Deep inspection")
@@ -954,11 +1153,15 @@ with training_tab:
     if task_art.model_results.empty:
         st.info("Train at least one model for this task first.")
     else:
-        st.dataframe(task_art.model_results[["Model", "Accuracy", "ROC-AUC"]].round(4), use_container_width=True)
+        st.dataframe(task_art.model_results[["Model", "Accuracy", "ROC-AUC"]].round(4), width="stretch")
         plot_model_comparison(task_art)
         plot_roc_for_task(task_art)
 
-        inspect_model = st.selectbox("Choose trained model to inspect", task_art.model_results["Model"].tolist(), key="inspect_model")
+        inspect_model = st.selectbox(
+            "Choose trained model to inspect",
+            task_art.model_results["Model"].tolist(),
+            key="inspect_model",
+        )
         c1, c2 = st.columns(2)
         with c1:
             plot_confusion_for_model(task_art, inspect_model)
@@ -969,7 +1172,7 @@ with training_tab:
 
 with prediction_tab:
     st.subheader("Live Prediction")
-    st.write("Only already-trained models appear here.")
+    st.write("Notebook-style live prediction with fixed default models for presentation.")
 
     patient_df = create_patient_input(raw_df)
 
@@ -977,22 +1180,20 @@ with prediction_tab:
     chosen_models = {}
 
     cols = st.columns(4)
-    col_idx = 0
-    for task_name in selectable_tasks:
+    for idx, task_name in enumerate(selectable_tasks):
         trained_models = artifacts[task_name].model_results["Model"].tolist()
-        with cols[col_idx % 4]:
+        with cols[idx % 4]:
             if trained_models:
-                default_model = best_model_name(artifacts[task_name])
+                fixed_default = notebook_default_model_name(artifacts[task_name])
                 chosen_models[task_name] = st.selectbox(
                     task_name,
                     trained_models,
-                    index=trained_models.index(default_model) if default_model in trained_models else 0,
+                    index=trained_models.index(fixed_default) if fixed_default in trained_models else 0,
                     key=f"pred_{task_name}",
                 )
-                st.caption(f"Using trained model list only")
+                st.caption(f"Default: {fixed_default}")
             else:
                 st.warning(f"No trained model yet for {task_name}")
-        col_idx += 1
 
     if st.button("Run live prediction", type="primary"):
         if not chosen_models:
@@ -1006,8 +1207,6 @@ with prediction_tab:
             mort_prob = results.get("Mortality", {}).get("probability", 0.0)
             severity_label = results.get("Severity", {}).get("label", "Unknown")
 
-            triage = triage_text(icu_prob, mort_prob, severity_label)
-
             st.markdown("### Prediction outputs")
             metric_cols = st.columns(max(1, len(results)))
             for i, task_name in enumerate(results.keys()):
@@ -1017,22 +1216,26 @@ with prediction_tab:
                     st.caption(f"Model used: {chosen_models[task_name]}")
 
             st.markdown("### Triage recommendation")
-            st.success(triage)
+            st.success(triage_text(icu_prob, mort_prob, severity_label))
 
             st.markdown("### Detailed probability tables")
             for task_name, out in results.items():
                 st.markdown(f"#### {task_name}")
                 if TASK_META[task_name]["binary"]:
-                    prob_df = pd.DataFrame({
-                        "Class": TASK_META[task_name]["display_classes"],
-                        "Probability": out["all_probabilities"],
-                    })
+                    prob_df = pd.DataFrame(
+                        {
+                            "Class": TASK_META[task_name]["display_classes"],
+                            "Probability": out["all_probabilities"],
+                        }
+                    )
                 else:
-                    prob_df = pd.DataFrame({
-                        "Class": list(artifacts[task_name].label_encoder.classes_),
-                        "Probability": out["all_probabilities"],
-                    })
-                st.dataframe(prob_df.round(4), use_container_width=True)
+                    prob_df = pd.DataFrame(
+                        {
+                            "Class": list(artifacts[task_name].label_encoder.classes_),
+                            "Probability": out["all_probabilities"],
+                        }
+                    )
+                st.dataframe(prob_df.round(4), width="stretch")
 
                 fig, ax = plt.subplots(figsize=(7, 3.5))
                 ax.bar(prob_df["Class"], prob_df["Probability"])
@@ -1042,9 +1245,7 @@ with prediction_tab:
                 st.pyplot(fig)
 
     st.markdown("### Patient row used for prediction")
-    st.dataframe(patient_df, use_container_width=True)
+    st.dataframe(patient_df, width="stretch")
 
 st.markdown("---")
-st.markdown(
-    ""
-)
+st.caption("Presentation tip: reload, train all tasks + all models once, then use the fixed Random Forest defaults in Live Prediction.")
